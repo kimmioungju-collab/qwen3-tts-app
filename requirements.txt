@@ -1,0 +1,20 @@
+# Qwen3-TTS Mac App Dependencies
+# NOTE: flash-attn is CUDA-only — do NOT install on Mac
+
+# Core TTS
+qwen-tts>=0.1.0
+
+# GUI
+PySide6>=6.7.0
+
+# Audio I/O
+sounddevice>=0.4.7
+soundfile>=0.12.1
+numpy>=1.26.0
+
+# Audio format conversion (m4a / mp3 / wav)
+pydub>=0.25.1
+scipy>=1.13.0
+
+# Model / Tensor
+torch>=2.3.0
