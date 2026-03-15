@@ -78,6 +78,28 @@ LANGUAGES: list[str] = [
     "German", "French", "Russian", "Portuguese", "Spanish", "Italian",
 ]
 
+# 모드별 호환 모델 매핑
+MODE_MODELS: dict[str, list[str]] = {
+    "custom": [
+        "0.6B-CustomVoice (경량 프리셋)",
+        "1.7B-CustomVoice (고품질 프리셋)",
+    ],
+    "design": [
+        "1.7B-VoiceDesign (보이스 디자인)",
+    ],
+    "clone": [
+        "0.6B-Base (경량 클론)",
+        "1.7B-Base (고품질 클론)",
+    ],
+}
+
+# 모드별 기본 모델
+MODE_DEFAULT_MODEL: dict[str, str] = {
+    "custom": "0.6B-CustomVoice (경량 프리셋)",
+    "design": "1.7B-VoiceDesign (보이스 디자인)",
+    "clone": "0.6B-Base (경량 클론)",
+}
+
 
 # ── 엔진 ───────────────────────────────────────────────────────────────────
 
@@ -134,12 +156,30 @@ class Qwen3TTSEngine:
             try:
                 from qwen_tts import Qwen3TTSModel
 
-                self._model = Qwen3TTSModel.from_pretrained(
-                    model_id,
-                    device_map=self.device,
-                    dtype=self.dtype,
-                    attn_implementation=self.attn,
-                )
+                if self.device == "mps":
+                    # MPS: accelerate의 meta-device 로딩(_load_state_dict_into_meta_model)이
+                    # 세그폴트 유발 → low_cpu_mem_usage=False로 구식 로딩 강제
+                    _report("CPU에 모델 로드 중... (MPS 안정성 우회)")
+                    model = Qwen3TTSModel.from_pretrained(
+                        model_id,
+                        dtype=torch.float32,
+                        attn_implementation=self.attn,
+                        low_cpu_mem_usage=False,
+                    )
+                    _report(f"MPS로 이동 중 (dtype={self.dtype})...")
+                    model.model = model.model.to(
+                        device=self.device, dtype=self.dtype,
+                    )
+                    # 래퍼의 device도 업데이트 (생성 시 input_ids를 이 device로 이동)
+                    model.device = torch.device(self.device)
+                    self._model = model
+                else:
+                    self._model = Qwen3TTSModel.from_pretrained(
+                        model_id,
+                        device_map=self.device,
+                        dtype=self.dtype,
+                        attn_implementation=self.attn,
+                    )
                 self._current_model_id = model_id
                 _report("✅ 모델 로드 완료")
             except Exception as e:

@@ -5,25 +5,38 @@ Qwen3-TTS Mac App
 """
 from __future__ import annotations
 
+import json
+import os
+# Mac: PyTorch + numpy + Qt가 각각 다른 libomp를 링크하여 충돌하는 문제 방지
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import shutil
 import sys
 import tempfile
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStatusBar,
-    QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
+    QStatusBar, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 import numpy as np
 
-from audio_utils import Player, Recorder, any_to_wav, numpy_to_wav, wav_to_m4a
-from tts_engine import LANGUAGES, MODELS, SPEAKERS, Qwen3TTSEngine
+from audio_utils import (
+    SAMPLE_RATE, Player, Recorder, any_to_wav,
+    download_youtube_audio, numpy_to_wav, transcribe_audio, wav_to_m4a,
+)
+from tts_engine import (
+    LANGUAGES, MODE_DEFAULT_MODEL, MODE_MODELS, MODELS, SPEAKERS,
+    Qwen3TTSEngine,
+)
 
 
 # ── 스타일 상수 ─────────────────────────────────────────────────────────────
@@ -37,11 +50,13 @@ SUCCESS  = "#A6E3A1"
 WARNING  = "#FAB387"
 DANGER   = "#F38BA8"
 
+VOICES_DIR = Path(__file__).resolve().parent / "voices"
+
 STYLE = f"""
 QMainWindow, QWidget {{
     background-color: {DARK_BG};
     color: {TEXT};
-    font-family: -apple-system, "SF Pro Text", "Helvetica Neue";
+    font-family: "Helvetica Neue";
     font-size: 13px;
 }}
 QTabWidget::pane {{
@@ -148,50 +163,10 @@ QStatusBar {{ color: {MUTED}; }}
 """
 
 
-# ── 워커 스레드 ─────────────────────────────────────────────────────────────
+# ── 워커 ────────────────────────────────────────────────────────────────────
+# NOTE: 스레드(QThread/threading) + transformers의 _load_state_dict_into_meta_model이
+#       MPS에서 세그폴트 유발. 메인 스레드 동기 실행 + processEvents()로 UI 응답 유지.
 
-
-class LoadWorker(QThread):
-    progress = Signal(str)
-    done     = Signal()
-    error    = Signal(str)
-
-    def __init__(self, engine: Qwen3TTSEngine, model_key: str) -> None:
-        super().__init__()
-        self.engine = engine
-        self.model_key = model_key
-
-    def run(self) -> None:
-        try:
-            self.engine.load_model(self.model_key, self.progress.emit)
-            self.done.emit()
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class GenerateWorker(QThread):
-    done  = Signal(object, int)   # (np.ndarray, sample_rate)
-    error = Signal(str)
-
-    def __init__(self, engine: Qwen3TTSEngine, mode: str, kwargs: dict) -> None:
-        super().__init__()
-        self.engine = engine
-        self.mode   = mode
-        self.kwargs = kwargs
-
-    def run(self) -> None:
-        try:
-            if self.mode == "custom":
-                audio, sr = self.engine.generate_custom_voice(**self.kwargs)
-            elif self.mode == "design":
-                audio, sr = self.engine.generate_voice_design(**self.kwargs)
-            elif self.mode == "clone":
-                audio, sr = self.engine.generate_voice_clone(**self.kwargs)
-            else:
-                raise ValueError(f"알 수 없는 모드: {self.mode}")
-            self.done.emit(audio, sr)
-        except Exception as e:
-            self.error.emit(str(e))
 
 
 # ── 탭 위젯들 ──────────────────────────────────────────────────────────────
@@ -307,6 +282,35 @@ class VoiceDesignTab(QWidget):
         }
 
 
+class YouTubeWorker(QThread):
+    """YouTube 다운로드 + Whisper 전사를 백그라운드 스레드에서 실행."""
+
+    progress = Signal(str)
+    finished = Signal(str, str)  # (wav_path, transcribed_text)
+    error = Signal(str)
+
+    def __init__(self, url: str, max_duration: int = 30) -> None:
+        super().__init__()
+        self._url = url
+        self._max_duration = max_duration
+
+    def run(self) -> None:
+        try:
+            wav_path = download_youtube_audio(
+                self._url,
+                max_duration=self._max_duration,
+                progress_cb=lambda msg: self.progress.emit(msg),
+            )
+            self.progress.emit("Whisper 전사 시작...")
+            text = transcribe_audio(
+                wav_path,
+                progress_cb=lambda msg: self.progress.emit(msg),
+            )
+            self.finished.emit(str(wav_path), text or "")
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class VoiceCloneTab(QWidget):
     ref_audio_path: str | None = None
 
@@ -319,6 +323,25 @@ class VoiceCloneTab(QWidget):
         self._rec_timer = QTimer()
         self._rec_timer.timeout.connect(self._update_rec_time)
         self._rec_start = 0.0
+        self._yt_worker: YouTubeWorker | None = None
+
+        # 저장된 목소리
+        saved_group = QGroupBox("📂 저장된 목소리")
+        saved_layout = QHBoxLayout(saved_group)
+        self.voice_combo = QComboBox()
+        self.voice_combo.setMinimumWidth(200)
+        self.voice_combo.currentTextChanged.connect(self._on_voice_selected)
+        saved_layout.addWidget(self.voice_combo, 1)
+        self.save_voice_btn = QPushButton("💾 현재 목소리 저장")
+        self.save_voice_btn.clicked.connect(self._save_voice)
+        saved_layout.addWidget(self.save_voice_btn)
+        self.del_voice_btn = QPushButton("🗑")
+        self.del_voice_btn.setFixedWidth(36)
+        self.del_voice_btn.setToolTip("선택한 목소리 삭제")
+        self.del_voice_btn.clicked.connect(self._delete_voice)
+        saved_layout.addWidget(self.del_voice_btn)
+        layout.addWidget(saved_group)
+        self._refresh_voice_list()
 
         # 레퍼런스 오디오
         ref_group = QGroupBox("🎵 레퍼런스 오디오 (3초 이상 권장)")
@@ -338,23 +361,19 @@ class VoiceCloneTab(QWidget):
         file_row.addWidget(self.clear_btn)
         ref_layout.addLayout(file_row)
 
-        # 읽을 문장 안내
-        script_box = QGroupBox("📖 아래 문장을 보며 읽어주세요")
-        script_layout = QVBoxLayout(script_box)
-        script_layout.setSpacing(4)
-        sentences = [
-            "1. 저는 매일 아침 따뜻한 커피 한 잔으로 하루를 시작합니다.",
-            "2. 파란 하늘 아래 초록빛 나무들이 바람에 살랑살랑 흔들리고 있어요.",
-            "3. 혹시 내일 오후에 시간이 괜찮으신가요? 같이 점심 먹으면 좋겠는데요.",
-            "4. 정말 놀랍네요! 이렇게 빨리 완성될 줄은 전혀 몰랐습니다.",
-            "5. 가족과 함께 보내는 저녁 시간이 하루 중 가장 행복한 순간입니다.",
-        ]
-        for s in sentences:
-            lbl = QLabel(s)
-            lbl.setWordWrap(True)
-            lbl.setStyleSheet(f"color: {TEXT}; font-size: 12px; padding: 2px 0;")
-            script_layout.addWidget(lbl)
-        ref_layout.addWidget(script_box)
+        # YouTube URL 입력
+        yt_row = QHBoxLayout()
+        self.yt_url_edit = QLineEdit()
+        self.yt_url_edit.setPlaceholderText("YouTube URL 붙여넣기 (예: https://youtu.be/...)")
+        yt_row.addWidget(self.yt_url_edit, 1)
+        self.yt_download_btn = QPushButton("▶ YouTube 다운로드")
+        self.yt_download_btn.clicked.connect(self._download_youtube)
+        yt_row.addWidget(self.yt_download_btn)
+        ref_layout.addLayout(yt_row)
+
+        self.yt_status_label = QLabel("")
+        self.yt_status_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        ref_layout.addWidget(self.yt_status_label)
 
         # 녹음 행
         rec_row = QHBoxLayout()
@@ -387,7 +406,7 @@ class VoiceCloneTab(QWidget):
 
         info = QLabel(
             "ℹ️ <b>VoiceClone</b> — 3초 샘플로 목소리 복제\n"
-            "모델: 0.6B-Base 또는 1.7B-Base 사용"
+            "YouTube URL / 파일 업로드 / 마이크 녹음 → 자동 텍스트 인식"
         )
         info.setWordWrap(True)
         info.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
@@ -436,13 +455,178 @@ class VoiceCloneTab(QWidget):
                 tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                 tmp.close()
                 import soundfile as sf
-                sf.write(tmp.name, audio, 16000)
+                sf.write(tmp.name, audio, SAMPLE_RATE)
                 self.ref_audio_path = tmp.name
-                self.rec_label.setText(f"녹음 완료 ({len(audio)/44100:.1f}초)")
+                self.rec_label.setText(f"녹음 완료 ({len(audio)/SAMPLE_RATE:.1f}초)")
                 self.rec_label.setStyleSheet(f"color: {SUCCESS};")
             else:
                 self.rec_label.setText("녹음 없음")
                 self.rec_label.setStyleSheet(f"color: {MUTED};")
+
+    def _download_youtube(self) -> None:
+        """YouTube URL에서 오디오 다운로드 + Whisper 자동 전사 (백그라운드 스레드)."""
+        url = self.yt_url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "URL 필요", "YouTube URL을 입력하세요.")
+            return
+
+        self.yt_download_btn.setEnabled(False)
+        self.yt_status_label.setText("다운로드 중...")
+        self.yt_status_label.setStyleSheet(f"color: {WARNING};")
+
+        self._yt_worker = YouTubeWorker(url, max_duration=30)
+        self._yt_worker.progress.connect(self._on_yt_progress)
+        self._yt_worker.finished.connect(self._on_yt_finished)
+        self._yt_worker.error.connect(self._on_yt_error)
+        self._yt_worker.start()
+
+    def _on_yt_progress(self, msg: str) -> None:
+        self.yt_status_label.setText(msg)
+
+    def _on_yt_finished(self, wav_path: str, text: str) -> None:
+        self.ref_audio_path = wav_path
+        self.file_label.setText(f"YouTube: {Path(wav_path).stem[:30]}")
+        self.file_label.setStyleSheet(f"color: {SUCCESS};")
+        self.clear_btn.setEnabled(True)
+        self.yt_download_btn.setEnabled(True)
+        if text:
+            self.ref_text_edit.setPlainText(text)
+            self.yt_status_label.setText("완료 — 오디오 + 텍스트 자동 입력됨")
+            self.yt_status_label.setStyleSheet(f"color: {SUCCESS};")
+        else:
+            self.yt_status_label.setText("오디오 다운로드 완료 (텍스트 인식 실패 — 수동 입력)")
+            self.yt_status_label.setStyleSheet(f"color: {WARNING};")
+
+    def _on_yt_error(self, err: str) -> None:
+        self.yt_status_label.setText(f"오류: {err}")
+        self.yt_status_label.setStyleSheet(f"color: {DANGER};")
+        self.yt_download_btn.setEnabled(True)
+
+    # ── 저장된 목소리 관리 ──────────────────────────────────────────────────
+
+    def _refresh_voice_list(self) -> None:
+        """voices/ 디렉토리 스캔하여 콤보 갱신."""
+        self.voice_combo.blockSignals(True)
+        self.voice_combo.clear()
+        self.voice_combo.addItem("— 새로 만들기 —")
+        VOICES_DIR.mkdir(parents=True, exist_ok=True)
+        for d in sorted(VOICES_DIR.iterdir()):
+            config_path = d / "config.json"
+            if not config_path.is_file():
+                continue
+            try:
+                cfg = json.loads(config_path.read_text(encoding="utf-8"))
+                label = cfg.get("display_name", d.name)
+                self.voice_combo.addItem(label, userData=d.name)
+            except (json.JSONDecodeError, OSError):
+                continue
+        self.voice_combo.blockSignals(False)
+        self.del_voice_btn.setEnabled(self.voice_combo.currentIndex() > 0)
+
+    def _on_voice_selected(self, text: str) -> None:
+        """콤보 선택 변경 시 프로필 로드 또는 초기화."""
+        idx = self.voice_combo.currentIndex()
+        self.del_voice_btn.setEnabled(idx > 0)
+        if idx <= 0:
+            return
+        voice_name = self.voice_combo.currentData()
+        if not voice_name:
+            return
+        self._load_saved_voice(voice_name)
+
+    def _load_saved_voice(self, name: str) -> None:
+        """저장된 목소리 프로필 로드 → ref_audio + ref_text 자동 채움."""
+        voice_dir = VOICES_DIR / name
+        config_path = voice_dir / "config.json"
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            QMessageBox.warning(self, "로드 실패", str(e))
+            return
+
+        audio_path = voice_dir / cfg.get("reference_audio", "reference.wav")
+        if not audio_path.exists():
+            QMessageBox.warning(self, "오류", f"오디오 파일 없음: {audio_path}")
+            return
+
+        self.ref_audio_path = str(audio_path)
+        self.file_label.setText(f"📂 {cfg.get('display_name', name)}")
+        self.file_label.setStyleSheet(f"color: {SUCCESS};")
+        self.clear_btn.setEnabled(True)
+        ref_text = cfg.get("reference_text", "")
+        if ref_text:
+            self.ref_text_edit.setPlainText(ref_text)
+
+    def _save_voice(self) -> None:
+        """현재 ref_audio + ref_text를 목소리 프로필로 저장."""
+        if not self.ref_audio_path:
+            QMessageBox.warning(self, "저장 불가", "레퍼런스 오디오를 먼저 설정하세요.")
+            return
+
+        name, ok = QInputDialog.getText(
+            self, "목소리 저장", "프로필 이름 (영문/한글):"
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        # 표시 이름 입력
+        display_name, ok = QInputDialog.getText(
+            self, "표시 이름", "목소리 설명 (예: '은우 목소리'):",
+            text=name,
+        )
+        if not ok:
+            return
+
+        voice_dir = VOICES_DIR / name
+        voice_dir.mkdir(parents=True, exist_ok=True)
+
+        # wav 복사
+        dst_wav = voice_dir / "reference.wav"
+        shutil.copy2(self.ref_audio_path, dst_wav)
+
+        # config 저장
+        config = {
+            "name": name,
+            "display_name": display_name or name,
+            "reference_audio": "reference.wav",
+            "reference_text": self.ref_text_edit.toPlainText().strip(),
+            "language": "Korean",
+            "description": f"{display_name or name} 목소리",
+        }
+        (voice_dir / "config.json").write_text(
+            json.dumps(config, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        self._refresh_voice_list()
+        # 방금 저장한 프로필 선택
+        for i in range(self.voice_combo.count()):
+            if self.voice_combo.itemData(i) == name:
+                self.voice_combo.setCurrentIndex(i)
+                break
+
+        QMessageBox.information(self, "저장 완료", f"'{display_name}' 저장됨")
+
+    def _delete_voice(self) -> None:
+        """선택된 목소리 프로필 삭제."""
+        idx = self.voice_combo.currentIndex()
+        if idx <= 0:
+            return
+        voice_name = self.voice_combo.currentData()
+        display = self.voice_combo.currentText()
+
+        reply = QMessageBox.question(
+            self, "삭제 확인",
+            f"'{display}'을(를) 삭제하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        voice_dir = VOICES_DIR / voice_name
+        shutil.rmtree(voice_dir, ignore_errors=True)
+        self._refresh_voice_list()
 
     def _update_rec_time(self) -> None:
         elapsed = int(time.time() - self._rec_start)
@@ -466,8 +650,6 @@ class MainWindow(QMainWindow):
         self.engine = Qwen3TTSEngine()
         self.player = Player()
         self._last_wav: Path | None = None
-        self._load_worker: LoadWorker | None = None
-        self._gen_worker: GenerateWorker | None = None
 
         self.setWindowTitle("Qwen3-TTS Voice Studio")
         self.setMinimumSize(800, 600)
@@ -475,6 +657,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._update_device_label()
+        # 초기 탭에 맞는 모델 목록으로 시작
+        self._on_tab_changed(self.tabs.currentIndex())
 
     # ── UI 구성 ────────────────────────────────────────────────────────────
 
@@ -507,8 +691,6 @@ class MainWindow(QMainWindow):
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel("모델:"))
         self.model_combo = QComboBox()
-        self.model_combo.addItems(MODELS.keys())
-        self.model_combo.setCurrentText("0.6B-Base (경량 클론)")
         self.model_combo.setMinimumWidth(260)
         model_row.addWidget(self.model_combo)
 
@@ -516,6 +698,10 @@ class MainWindow(QMainWindow):
         self.load_btn.setObjectName("primary")
         self.load_btn.clicked.connect(self._load_model)
         model_row.addWidget(self.load_btn)
+
+        self.model_status_label = QLabel("")
+        self.model_status_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        model_row.addWidget(self.model_status_label)
         model_row.addStretch()
         root.addLayout(model_row)
 
@@ -544,6 +730,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.clone_tab,   "🔄 Voice Clone")
         root.addWidget(self.tabs)
 
+        # 탭 인덱스 → 모드 이름 (시그널 연결 전에 정의)
+        self._tab_modes = {0: "custom", 1: "design", 2: "clone"}
+
         # ── 생성 버튼 ──────────────────────────────────────────────────────
         gen_row = QHBoxLayout()
         self.gen_btn = QPushButton("▶ 음성 생성")
@@ -552,6 +741,10 @@ class MainWindow(QMainWindow):
         self.gen_btn.setEnabled(False)
         self.gen_btn.clicked.connect(self._generate)
         gen_row.addWidget(self.gen_btn, 1)
+
+        # gen_btn 생성 후 탭 시그널 연결 & 초기 탭 설정
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.setCurrentIndex(2)  # Voice Clone 기본 선택
 
         self.gen_progress = QProgressBar()
         self.gen_progress.setRange(0, 0)
@@ -583,7 +776,7 @@ class MainWindow(QMainWindow):
         # ── 상태바 ─────────────────────────────────────────────────────────
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("모델을 먼저 로드하세요.")
+        self.status_bar.showMessage("모드 탭을 선택하고 모델을 로드하세요.")
 
     # ── 디바이스 레이블 ────────────────────────────────────────────────────
 
@@ -591,35 +784,93 @@ class MainWindow(QMainWindow):
         info = self.engine.device_info()
         self.device_label.setText(f"🖥 {info}")
 
+    # ── 탭-모델 연동 ──────────────────────────────────────────────────────
+
+    def _current_mode(self) -> str:
+        return self._tab_modes.get(self.tabs.currentIndex(), "custom")
+
+    def _on_tab_changed(self, index: int) -> None:
+        """탭 전환 시 호환 모델 목록으로 콤보 교체 + 자동 선택."""
+        mode = self._tab_modes.get(index, "custom")
+        compatible = MODE_MODELS.get(mode, list(MODELS.keys()))
+        default = MODE_DEFAULT_MODEL.get(mode, compatible[0])
+
+        # 로드된 모델이 새 탭에도 호환되면 그 모델을 선택, 아니면 기본값
+        selected = default
+        if self.engine.is_loaded:
+            loaded_id = self.engine._current_model_id
+            for key in compatible:
+                if MODELS[key] == loaded_id:
+                    selected = key
+                    break
+
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        self.model_combo.addItems(compatible)
+        self.model_combo.setCurrentText(selected)
+        self.model_combo.blockSignals(False)
+
+        # 이미 로드된 모델이 호환되는지 표시
+        if self.engine.is_loaded:
+            loaded_id = self.engine._current_model_id
+            compatible_ids = [MODELS[k] for k in compatible]
+            if loaded_id in compatible_ids:
+                self.model_status_label.setText("✅ 로드된 모델 호환")
+                self.model_status_label.setStyleSheet(f"color: {SUCCESS};")
+                self.gen_btn.setEnabled(True)
+            else:
+                self.model_status_label.setText("⚠️ 로드된 모델 비호환 — 다시 로드 필요")
+                self.model_status_label.setStyleSheet(f"color: {WARNING};")
+                self.gen_btn.setEnabled(False)
+        else:
+            self.model_status_label.setText("")
+
     # ── 모델 로드 ──────────────────────────────────────────────────────────
 
     def _load_model(self) -> None:
+        """메인 스레드에서 동기 로드 (스레드 + transformers = MPS 세그폴트)."""
         model_key = self.model_combo.currentText()
         self.load_btn.setEnabled(False)
         self.gen_btn.setEnabled(False)
         self.load_progress.setVisible(True)
         self.load_log.setText("로드 준비 중...")
+        QApplication.processEvents()
 
-        self._load_worker = LoadWorker(self.engine, model_key)
-        self._load_worker.progress.connect(self.load_log.setText)
-        self._load_worker.done.connect(self._on_load_done)
-        self._load_worker.error.connect(self._on_load_error)
-        self._load_worker.start()
+        def _progress(msg: str) -> None:
+            self.load_log.setText(msg)
+            QApplication.processEvents()
 
-    def _on_load_done(self) -> None:
-        self.load_progress.setVisible(False)
-        self.load_btn.setEnabled(True)
-        self.gen_btn.setEnabled(True)
-        self.load_log.setText("✅ 모델 로드 완료")
-        self.load_log.setStyleSheet(f"color: {SUCCESS};")
-        self.status_bar.showMessage("준비됨 — 텍스트 입력 후 음성 생성을 클릭하세요.")
+        try:
+            self.engine.load_model(model_key, _progress)
+            # 성공 — 콤보를 로드된 모델로 유지 (_on_tab_changed 호출 시 기본값으로 리셋되므로 직접 설정)
+            self.load_progress.setVisible(False)
+            self.load_btn.setEnabled(True)
+            self.load_log.setText(f"✅ 모델 로드 완료: {model_key}")
+            self.load_log.setStyleSheet(f"color: {SUCCESS};")
+            self.status_bar.showMessage("준비됨 — 텍스트 입력 후 음성 생성을 클릭하세요.")
 
-    def _on_load_error(self, err: str) -> None:
-        self.load_progress.setVisible(False)
-        self.load_btn.setEnabled(True)
-        self.load_log.setText(f"❌ {err}")
-        self.load_log.setStyleSheet(f"color: {DANGER};")
-        QMessageBox.critical(self, "모델 로드 실패", err)
+            # 콤보를 로드된 모델로 설정 (리셋 방지)
+            self.model_combo.blockSignals(True)
+            self.model_combo.setCurrentText(model_key)
+            self.model_combo.blockSignals(False)
+
+            # 호환성 검증 후 생성 버튼 활성화
+            mode = self._current_mode()
+            compatible_ids = [MODELS[k] for k in MODE_MODELS.get(mode, [])]
+            is_compatible = self.engine._current_model_id in compatible_ids
+            self.gen_btn.setEnabled(is_compatible)
+            if is_compatible:
+                self.model_status_label.setText("✅ 로드된 모델 호환")
+                self.model_status_label.setStyleSheet(f"color: {SUCCESS};")
+            else:
+                self.model_status_label.setText("⚠️ 로드된 모델 비호환 — 다시 로드 필요")
+                self.model_status_label.setStyleSheet(f"color: {WARNING};")
+        except Exception as e:
+            self.load_progress.setVisible(False)
+            self.load_btn.setEnabled(True)
+            self.load_log.setText(f"❌ {e}")
+            self.load_log.setStyleSheet(f"color: {DANGER};")
+            QMessageBox.critical(self, "모델 로드 실패", str(e))
 
     # ── 음성 생성 ──────────────────────────────────────────────────────────
 
@@ -629,6 +880,24 @@ class MainWindow(QMainWindow):
 
         if not text:
             QMessageBox.warning(self, "입력 필요", "합성할 텍스트를 입력하세요.")
+            return
+
+        if not self.engine.is_loaded:
+            QMessageBox.warning(self, "모델 미로드", "먼저 모델을 로드하세요.")
+            return
+
+        # 모델-모드 호환성 검증
+        mode = self._current_mode()
+        compatible_ids = [MODELS[k] for k in MODE_MODELS.get(mode, [])]
+        if self.engine._current_model_id not in compatible_ids:
+            mode_labels = {"custom": "Custom Voice", "design": "Voice Design", "clone": "Voice Clone"}
+            compatible_names = "\n".join(f"  • {k}" for k in MODE_MODELS.get(mode, []))
+            QMessageBox.warning(
+                self, "모델 비호환",
+                f"{mode_labels.get(mode, mode)} 모드에는 다음 모델이 필요합니다:\n\n"
+                f"{compatible_names}\n\n"
+                f"모델을 다시 로드해주세요.",
+            )
             return
 
         tab = self.tabs.currentIndex()
@@ -655,33 +924,36 @@ class MainWindow(QMainWindow):
         self.result_label.setText("생성 중...")
         self.play_btn.setEnabled(False)
         self.download_btn.setEnabled(False)
+        QApplication.processEvents()
 
-        self._gen_worker = GenerateWorker(self.engine, mode, kwargs)
-        self._gen_worker.done.connect(self._on_gen_done)
-        self._gen_worker.error.connect(self._on_gen_error)
-        self._gen_worker.start()
+        try:
+            if mode == "custom":
+                audio, sr = self.engine.generate_custom_voice(**kwargs)
+            elif mode == "design":
+                audio, sr = self.engine.generate_voice_design(**kwargs)
+            elif mode == "clone":
+                audio, sr = self.engine.generate_voice_clone(**kwargs)
+            else:
+                raise ValueError(f"알 수 없는 모드: {mode}")
 
-    def _on_gen_done(self, audio: object, sr: int) -> None:
-        self.gen_progress.setVisible(False)
-        self.gen_btn.setEnabled(True)
+            audio_arr = np.array(audio)
+            self._last_wav = numpy_to_wav(audio_arr, sr)
+            duration = len(audio_arr) / sr
 
-        audio_arr = np.array(audio)
-        self._last_wav = numpy_to_wav(audio_arr, sr)
-
-        duration = len(audio_arr) / sr
-        self.result_label.setText(f"✅ 생성 완료 — {duration:.1f}초")
-        self.result_label.setStyleSheet(f"color: {SUCCESS};")
-        self.play_btn.setEnabled(True)
-        self.download_btn.setEnabled(True)
-        self.status_bar.showMessage(f"음성 생성 완료 ({duration:.1f}초)")
-
-    def _on_gen_error(self, err: str) -> None:
-        self.gen_progress.setVisible(False)
-        self.gen_btn.setEnabled(True)
-        self.result_label.setText(f"❌ 오류")
-        self.result_label.setStyleSheet(f"color: {DANGER};")
-        self.status_bar.showMessage("생성 실패")
-        QMessageBox.critical(self, "생성 오류", err)
+            self.gen_progress.setVisible(False)
+            self.gen_btn.setEnabled(True)
+            self.result_label.setText(f"✅ 생성 완료 — {duration:.1f}초")
+            self.result_label.setStyleSheet(f"color: {SUCCESS};")
+            self.play_btn.setEnabled(True)
+            self.download_btn.setEnabled(True)
+            self.status_bar.showMessage(f"음성 생성 완료 ({duration:.1f}초)")
+        except Exception as e:
+            self.gen_progress.setVisible(False)
+            self.gen_btn.setEnabled(True)
+            self.result_label.setText("❌ 생성 실패 — 아래 오류 확인")
+            self.result_label.setStyleSheet(f"color: {DANGER};")
+            self.status_bar.showMessage("생성 실패")
+            QMessageBox.critical(self, "생성 오류", f"음성 생성 중 오류가 발생했습니다:\n\n{e}")
 
     # ── 재생 & 다운로드 ────────────────────────────────────────────────────
 
@@ -721,20 +993,28 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
-    # 환경 사전 체크
+    # 환경 사전 체크 (GUI 실행은 차단하지 않음)
     from env_check import run_checks
     report = run_checks()
     print(report.summary())
-
-    if report.has_critical:
-        print("\n❌ 필수 항목 오류 — setup_env.sh 실행 후 재시도하세요.")
-        sys.exit(1)
 
     app = QApplication(sys.argv)
     app.setApplicationName("Qwen3-TTS Voice Studio")
 
     win = MainWindow()
     win.show()
+
+    # critical 오류가 있으면 GUI 안에서 경고 표시 (앱은 띄운 상태로)
+    if report.has_critical:
+        missing = [r for r in report.results if r.status == "FAIL"]
+        details = "\n".join(f"  • {r.name}: {r.message}\n    → {r.fix}" for r in missing)
+        QMessageBox.warning(
+            win, "환경 설정 필요",
+            f"일부 필수 패키지가 누락되었습니다:\n\n{details}\n\n"
+            f"설치 후 앱을 재시작하세요.\n"
+            f"(모델 로드 시 오류가 발생할 수 있습니다)",
+        )
+
     sys.exit(app.exec())
 
 
