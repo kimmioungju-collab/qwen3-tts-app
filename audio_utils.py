@@ -2,6 +2,8 @@
 [Senior Developer] 오디오 유틸리티
 - 마이크 녹음 (sounddevice)
 - 포맷 변환 (m4a / mp3 → wav, wav → m4a)
+- YouTube 오디오 다운로드 (yt-dlp)
+- 음성 → 텍스트 전사 (whisper)
 - 임시 파일 관리
 """
 from __future__ import annotations
@@ -11,6 +13,7 @@ import shutil
 import tempfile
 import threading
 import time
+import typing
 from pathlib import Path
 
 import numpy as np
@@ -165,6 +168,110 @@ def numpy_to_wav(audio: np.ndarray, sample_rate: int) -> Path:
     tmp.close()
     sf.write(tmp.name, audio, sample_rate)
     return Path(tmp.name)
+
+
+# ── 재생 ───────────────────────────────────────────────────────────────────
+
+
+# ── YouTube 다운로드 ──────────────────────────────────────────────────────
+
+
+def download_youtube_audio(
+    url: str,
+    max_duration: int = 30,
+    progress_cb: typing.Callable[[str], None] | None = None,
+) -> Path:
+    """YouTube URL → 임시 wav 파일 (최대 max_duration초).
+
+    yt-dlp CLI를 사용하여 오디오 다운로드 후 wav 변환.
+    """
+    _require_ffmpeg()
+    if not shutil.which("yt-dlp"):
+        raise RuntimeError(
+            "yt-dlp가 설치되지 않았습니다.\n"
+            "  brew install yt-dlp  로 설치 후 재시도하세요."
+        )
+
+    def _report(msg: str) -> None:
+        if progress_cb:
+            progress_cb(msg)
+
+    tmp_dir = tempfile.mkdtemp(prefix="qwen_yt_")
+    tmp_audio = Path(tmp_dir) / "audio.%(ext)s"
+
+    _report("YouTube 오디오 다운로드 중...")
+    import subprocess
+
+    # yt-dlp로 오디오만 추출 (최대 max_duration초)
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--extract-audio",
+        "--audio-format", "wav",
+        "--audio-quality", "0",
+        "--postprocessor-args", f"ffmpeg:-ac 1 -ar {SAMPLE_RATE} -t {max_duration}",
+        "-o", str(tmp_audio),
+        url,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f"yt-dlp 다운로드 실패:\n{result.stderr[:500]}")
+
+    # 다운로드된 wav 파일 찾기
+    wav_files = list(Path(tmp_dir).glob("audio.*"))
+    if not wav_files:
+        raise RuntimeError("다운로드된 오디오 파일을 찾을 수 없습니다.")
+
+    # 최종 wav로 복사
+    final_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    final_wav.close()
+    shutil.move(str(wav_files[0]), final_wav.name)
+
+    # 임시 디렉토리 정리
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    _report("다운로드 완료")
+    return Path(final_wav.name)
+
+
+# ── 음성 전사 (Whisper) ──────────────────────────────────────────────────
+
+
+def transcribe_audio(
+    wav_path: str | Path,
+    language: str | None = None,
+    progress_cb: typing.Callable[[str], None] | None = None,
+) -> str:
+    """wav 파일 → 텍스트 전사 (openai-whisper).
+
+    language: "ko", "en", "ja" 등 ISO 639-1 코드. None이면 자동 감지.
+    """
+    def _report(msg: str) -> None:
+        if progress_cb:
+            progress_cb(msg)
+
+    try:
+        import whisper
+    except ImportError:
+        raise RuntimeError(
+            "whisper가 설치되지 않았습니다.\n"
+            "  pip install openai-whisper  로 설치 후 재시도하세요."
+        )
+
+    _report("Whisper 모델 로드 중 (turbo)...")
+    model = whisper.load_model("turbo")
+
+    _report("음성 인식 중...")
+    result = model.transcribe(
+        str(wav_path),
+        language=language,
+        fp16=False,  # MPS/CPU 안전
+    )
+
+    text = result.get("text", "").strip()
+    detected_lang = result.get("language", "unknown")
+    _report(f"전사 완료 (감지 언어: {detected_lang})")
+    return text
 
 
 # ── 재생 ───────────────────────────────────────────────────────────────────

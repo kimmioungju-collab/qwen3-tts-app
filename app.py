@@ -28,7 +28,10 @@ from PySide6.QtWidgets import (
 
 import numpy as np
 
-from audio_utils import SAMPLE_RATE, Player, Recorder, any_to_wav, numpy_to_wav, wav_to_m4a
+from audio_utils import (
+    SAMPLE_RATE, Player, Recorder, any_to_wav,
+    download_youtube_audio, numpy_to_wav, transcribe_audio, wav_to_m4a,
+)
 from tts_engine import (
     LANGUAGES, MODE_DEFAULT_MODEL, MODE_MODELS, MODELS, SPEAKERS,
     Qwen3TTSEngine,
@@ -307,23 +310,19 @@ class VoiceCloneTab(QWidget):
         file_row.addWidget(self.clear_btn)
         ref_layout.addLayout(file_row)
 
-        # 읽을 문장 안내
-        script_box = QGroupBox("📖 아래 문장을 보며 읽어주세요")
-        script_layout = QVBoxLayout(script_box)
-        script_layout.setSpacing(4)
-        sentences = [
-            "1. 저는 매일 아침 따뜻한 커피 한 잔으로 하루를 시작합니다.",
-            "2. 파란 하늘 아래 초록빛 나무들이 바람에 살랑살랑 흔들리고 있어요.",
-            "3. 혹시 내일 오후에 시간이 괜찮으신가요? 같이 점심 먹으면 좋겠는데요.",
-            "4. 정말 놀랍네요! 이렇게 빨리 완성될 줄은 전혀 몰랐습니다.",
-            "5. 가족과 함께 보내는 저녁 시간이 하루 중 가장 행복한 순간입니다.",
-        ]
-        for s in sentences:
-            lbl = QLabel(s)
-            lbl.setWordWrap(True)
-            lbl.setStyleSheet(f"color: {TEXT}; font-size: 12px; padding: 2px 0;")
-            script_layout.addWidget(lbl)
-        ref_layout.addWidget(script_box)
+        # YouTube URL 입력
+        yt_row = QHBoxLayout()
+        self.yt_url_edit = QLineEdit()
+        self.yt_url_edit.setPlaceholderText("YouTube URL 붙여넣기 (예: https://youtu.be/...)")
+        yt_row.addWidget(self.yt_url_edit, 1)
+        self.yt_download_btn = QPushButton("▶ YouTube 다운로드")
+        self.yt_download_btn.clicked.connect(self._download_youtube)
+        yt_row.addWidget(self.yt_download_btn)
+        ref_layout.addLayout(yt_row)
+
+        self.yt_status_label = QLabel("")
+        self.yt_status_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        ref_layout.addWidget(self.yt_status_label)
 
         # 녹음 행
         rec_row = QHBoxLayout()
@@ -356,7 +355,7 @@ class VoiceCloneTab(QWidget):
 
         info = QLabel(
             "ℹ️ <b>VoiceClone</b> — 3초 샘플로 목소리 복제\n"
-            "모델: 0.6B-Base 또는 1.7B-Base 사용"
+            "YouTube URL / 파일 업로드 / 마이크 녹음 → 자동 텍스트 인식"
         )
         info.setWordWrap(True)
         info.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
@@ -412,6 +411,45 @@ class VoiceCloneTab(QWidget):
             else:
                 self.rec_label.setText("녹음 없음")
                 self.rec_label.setStyleSheet(f"color: {MUTED};")
+
+    def _download_youtube(self) -> None:
+        """YouTube URL에서 오디오 다운로드 + Whisper 자동 전사."""
+        url = self.yt_url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "URL 필요", "YouTube URL을 입력하세요.")
+            return
+
+        self.yt_download_btn.setEnabled(False)
+        self.yt_status_label.setText("다운로드 중...")
+        self.yt_status_label.setStyleSheet(f"color: {WARNING};")
+        QApplication.processEvents()
+
+        def _progress(msg: str) -> None:
+            self.yt_status_label.setText(msg)
+            QApplication.processEvents()
+
+        try:
+            wav_path = download_youtube_audio(url, max_duration=30, progress_cb=_progress)
+            self.ref_audio_path = str(wav_path)
+            self.file_label.setText(f"YouTube: {Path(url).name[:30]}")
+            self.file_label.setStyleSheet(f"color: {SUCCESS};")
+            self.clear_btn.setEnabled(True)
+
+            # Whisper 자동 전사
+            _progress("Whisper 전사 시작...")
+            text = transcribe_audio(wav_path, progress_cb=_progress)
+            if text:
+                self.ref_text_edit.setPlainText(text)
+                self.yt_status_label.setText(f"완료 — 오디오 + 텍스트 자동 입력됨")
+                self.yt_status_label.setStyleSheet(f"color: {SUCCESS};")
+            else:
+                self.yt_status_label.setText("오디오 다운로드 완료 (텍스트 인식 실패 — 수동 입력)")
+                self.yt_status_label.setStyleSheet(f"color: {WARNING};")
+        except Exception as e:
+            self.yt_status_label.setText(f"오류: {e}")
+            self.yt_status_label.setStyleSheet(f"color: {DANGER};")
+        finally:
+            self.yt_download_btn.setEnabled(True)
 
     def _update_rec_time(self) -> None:
         elapsed = int(time.time() - self._rec_start)
