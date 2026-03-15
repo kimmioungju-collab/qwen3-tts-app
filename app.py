@@ -5,6 +5,10 @@ Qwen3-TTS Mac App
 """
 from __future__ import annotations
 
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import json
 import shutil
 import sys
 import tempfile
@@ -15,9 +19,9 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStatusBar,
-    QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
+    QStatusBar, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 import numpy as np
@@ -146,6 +150,59 @@ QLabel#status_warn {{ color: {WARNING}; }}
 QLabel#status_err  {{ color: {DANGER}; }}
 QStatusBar {{ color: {MUTED}; }}
 """
+
+
+VOICES_DIR = Path(__file__).parent / "voices"
+
+
+def list_voice_profiles() -> list[dict]:
+    """voices/ 디렉토리에서 저장된 프로필 목록 반환."""
+    profiles: list[dict] = []
+    if not VOICES_DIR.exists():
+        return profiles
+    for voice_dir in sorted(VOICES_DIR.iterdir()):
+        config_path = voice_dir / "config.json"
+        if not config_path.exists():
+            continue
+        with open(config_path, encoding="utf-8") as f:
+            profiles.append(json.load(f))
+    return profiles
+
+
+def save_voice_profile(
+    name: str,
+    display_name: str,
+    ref_audio_path: str,
+    ref_text: str,
+    language: str = "Korean",
+    description: str = "",
+) -> Path:
+    """목소리 프로필 저장 (레퍼런스 오디오 + 텍스트 포함)."""
+    voice_dir = VOICES_DIR / name
+    voice_dir.mkdir(parents=True, exist_ok=True)
+
+    dest_wav = voice_dir / "reference.wav"
+    shutil.copy2(ref_audio_path, dest_wav)
+
+    config = {
+        "name": name,
+        "display_name": display_name,
+        "reference_audio": "reference.wav",
+        "reference_text": ref_text,
+        "language": language,
+        "description": description or f"{display_name} 목소리",
+    }
+    with open(voice_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    return voice_dir
+
+
+def delete_voice_profile(name: str) -> None:
+    """목소리 프로필 삭제."""
+    voice_dir = VOICES_DIR / name
+    if voice_dir.exists():
+        shutil.rmtree(voice_dir)
 
 
 # ── 워커 스레드 ─────────────────────────────────────────────────────────────
@@ -320,7 +377,34 @@ class VoiceCloneTab(QWidget):
         self._rec_timer.timeout.connect(self._update_rec_time)
         self._rec_start = 0.0
 
-        # 레퍼런스 오디오
+        # ── 저장된 목소리 로드/삭제 ──────────────────────────────────────────
+        saved_group = QGroupBox("💾 저장된 목소리")
+        saved_layout = QHBoxLayout(saved_group)
+
+        self.voice_combo = QComboBox()
+        self.voice_combo.setMinimumWidth(200)
+        self.voice_combo.addItem("-- 선택 --")
+        self.voice_combo.currentIndexChanged.connect(self._on_voice_selected)
+        saved_layout.addWidget(self.voice_combo, 1)
+
+        self.load_voice_btn = QPushButton("📂 불러오기")
+        self.load_voice_btn.setEnabled(False)
+        self.load_voice_btn.clicked.connect(self._load_selected_voice)
+        saved_layout.addWidget(self.load_voice_btn)
+
+        self.delete_voice_btn = QPushButton("🗑")
+        self.delete_voice_btn.setEnabled(False)
+        self.delete_voice_btn.setFixedWidth(40)
+        self.delete_voice_btn.clicked.connect(self._delete_selected_voice)
+        saved_layout.addWidget(self.delete_voice_btn)
+
+        self.save_voice_btn = QPushButton("💾 현재 목소리 저장")
+        self.save_voice_btn.clicked.connect(self._save_current_voice)
+        saved_layout.addWidget(self.save_voice_btn)
+
+        layout.addWidget(saved_group)
+
+        # ── 레퍼런스 오디오 ──────────────────────────────────────────────────
         ref_group = QGroupBox("🎵 레퍼런스 오디오 (3초 이상 권장)")
         ref_layout = QVBoxLayout(ref_group)
 
@@ -370,7 +454,7 @@ class VoiceCloneTab(QWidget):
         ref_layout.addLayout(rec_row)
         layout.addWidget(ref_group)
 
-        # 레퍼런스 텍스트
+        # ── 레퍼런스 텍스트 ──────────────────────────────────────────────────
         text_group = QGroupBox("📄 레퍼런스 텍스트 (오디오의 내용)")
         text_layout = QVBoxLayout(text_group)
         self.ref_text_edit = QTextEdit()
@@ -393,6 +477,121 @@ class VoiceCloneTab(QWidget):
         info.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         layout.addWidget(info)
         layout.addStretch()
+
+        # 초기 목소리 목록 로드
+        self._refresh_voice_list()
+
+    # ── 저장된 목소리 관리 ──────────────────────────────────────────────────
+
+    def _refresh_voice_list(self) -> None:
+        """voices/ 디렉토리 스캔하여 콤보박스 갱신."""
+        self.voice_combo.blockSignals(True)
+        self.voice_combo.clear()
+        self.voice_combo.addItem("-- 선택 --")
+        for profile in list_voice_profiles():
+            display = profile.get("display_name", profile["name"])
+            self.voice_combo.addItem(display, userData=profile)
+        self.voice_combo.blockSignals(False)
+        self.load_voice_btn.setEnabled(False)
+        self.delete_voice_btn.setEnabled(False)
+
+    def _on_voice_selected(self, index: int) -> None:
+        has_selection = index > 0
+        self.load_voice_btn.setEnabled(has_selection)
+        self.delete_voice_btn.setEnabled(has_selection)
+
+    def _load_selected_voice(self) -> None:
+        """선택된 프로필의 오디오+텍스트를 UI에 채움."""
+        profile = self.voice_combo.currentData()
+        if not profile:
+            return
+
+        voice_dir = VOICES_DIR / profile["name"]
+        ref_wav = voice_dir / profile.get("reference_audio", "reference.wav")
+
+        if not ref_wav.exists():
+            QMessageBox.warning(self, "오류", f"레퍼런스 오디오를 찾을 수 없습니다:\n{ref_wav}")
+            return
+
+        self.ref_audio_path = str(ref_wav)
+        self.file_label.setText(f"{profile.get('display_name', profile['name'])} (저장됨)")
+        self.file_label.setStyleSheet(f"color: {SUCCESS};")
+        self.clear_btn.setEnabled(True)
+
+        ref_text = profile.get("reference_text", "")
+        if ref_text:
+            self.ref_text_edit.setPlainText(ref_text)
+
+    def _save_current_voice(self) -> None:
+        """현재 레퍼런스 오디오+텍스트를 프로필로 저장."""
+        if not self.ref_audio_path:
+            QMessageBox.warning(self, "입력 필요",
+                                "먼저 레퍼런스 오디오를 업로드하거나 녹음하세요.")
+            return
+
+        ref_text = self.ref_text_edit.toPlainText().strip()
+        if not ref_text:
+            QMessageBox.warning(self, "입력 필요",
+                                "레퍼런스 텍스트를 입력하세요.\n"
+                                "(오디오에서 말한 내용과 일치해야 합니다)")
+            return
+
+        name, ok = QInputDialog.getText(
+            self, "프로필 이름", "영문 ID (예: eunwoo, myvoice):"
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        display_name, ok = QInputDialog.getText(
+            self, "표시 이름", "표시 이름 (예: 김은우 (큰아들)):",
+            text=name,
+        )
+        if not ok or not display_name.strip():
+            return
+        display_name = display_name.strip()
+
+        existing = VOICES_DIR / name
+        if existing.exists():
+            reply = QMessageBox.question(
+                self, "덮어쓰기",
+                f"'{name}' 프로필이 이미 존재합니다. 덮어쓰시겠습니까?",
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        save_voice_profile(
+            name=name,
+            display_name=display_name,
+            ref_audio_path=self.ref_audio_path,
+            ref_text=ref_text,
+        )
+
+        self._refresh_voice_list()
+        QMessageBox.information(self, "저장 완료",
+                                f"'{display_name}' 프로필이 저장되었습니다.\n"
+                                f"CLI에서도 사용 가능: tts --voice {name} \"텍스트\"")
+
+    def _delete_selected_voice(self) -> None:
+        """선택된 프로필 삭제."""
+        profile = self.voice_combo.currentData()
+        if not profile:
+            return
+
+        display = profile.get("display_name", profile["name"])
+        reply = QMessageBox.question(
+            self, "삭제 확인",
+            f"'{display}' 프로필을 삭제하시겠습니까?\n"
+            f"(레퍼런스 오디오도 함께 삭제됩니다)",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        delete_voice_profile(profile["name"])
+        self._refresh_voice_list()
+        self._clear_file()
+
+    # ── 오디오 입력 ────────────────────────────────────────────────────────
 
     def _upload_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -438,7 +637,7 @@ class VoiceCloneTab(QWidget):
                 import soundfile as sf
                 sf.write(tmp.name, audio, 16000)
                 self.ref_audio_path = tmp.name
-                self.rec_label.setText(f"녹음 완료 ({len(audio)/44100:.1f}초)")
+                self.rec_label.setText(f"녹음 완료 ({len(audio)/16000:.1f}초)")
                 self.rec_label.setStyleSheet(f"color: {SUCCESS};")
             else:
                 self.rec_label.setText("녹음 없음")
