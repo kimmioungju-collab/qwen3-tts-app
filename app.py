@@ -16,7 +16,7 @@ from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QSizePolicy, QStatusBar,
+    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStatusBar,
     QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -334,6 +334,24 @@ class VoiceCloneTab(QWidget):
         file_row.addWidget(self.upload_btn)
         ref_layout.addLayout(file_row)
 
+        # 읽을 문장 안내
+        script_box = QGroupBox("📖 아래 문장을 보며 읽어주세요")
+        script_layout = QVBoxLayout(script_box)
+        script_layout.setSpacing(4)
+        sentences = [
+            "1. 저는 매일 아침 따뜻한 커피 한 잔으로 하루를 시작합니다.",
+            "2. 파란 하늘 아래 초록빛 나무들이 바람에 살랑살랑 흔들리고 있어요.",
+            "3. 혹시 내일 오후에 시간이 괜찮으신가요? 같이 점심 먹으면 좋겠는데요.",
+            "4. 정말 놀랍네요! 이렇게 빨리 완성될 줄은 전혀 몰랐습니다.",
+            "5. 가족과 함께 보내는 저녁 시간이 하루 중 가장 행복한 순간입니다.",
+        ]
+        for s in sentences:
+            lbl = QLabel(s)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet(f"color: {TEXT}; font-size: 12px; padding: 2px 0;")
+            script_layout.addWidget(lbl)
+        ref_layout.addWidget(script_box)
+
         # 녹음 행
         rec_row = QHBoxLayout()
         self.record_btn = QPushButton("🎙")
@@ -352,9 +370,12 @@ class VoiceCloneTab(QWidget):
         text_group = QGroupBox("📄 레퍼런스 텍스트 (오디오의 내용)")
         text_layout = QVBoxLayout(text_group)
         self.ref_text_edit = QTextEdit()
-        self.ref_text_edit.setPlaceholderText(
-            "레퍼런스 오디오에서 말하는 내용을 그대로 입력하세요.\n"
-            "예) Hello, this is my reference voice recording."
+        self.ref_text_edit.setPlainText(
+            "저는 매일 아침 따뜻한 커피 한 잔으로 하루를 시작합니다. "
+            "파란 하늘 아래 초록빛 나무들이 바람에 살랑살랑 흔들리고 있어요. "
+            "혹시 내일 오후에 시간이 괜찮으신가요? 같이 점심 먹으면 좋겠는데요. "
+            "정말 놀랍네요! 이렇게 빨리 완성될 줄은 전혀 몰랐습니다. "
+            "가족과 함께 보내는 저녁 시간이 하루 중 가장 행복한 순간입니다."
         )
         self.ref_text_edit.setMaximumHeight(80)
         text_layout.addWidget(self.ref_text_edit)
@@ -438,7 +459,7 @@ class MainWindow(QMainWindow):
         self._gen_worker: GenerateWorker | None = None
 
         self.setWindowTitle("Qwen3-TTS Voice Studio")
-        self.setMinimumSize(760, 680)
+        self.setMinimumSize(800, 600)
         self.setStyleSheet(STYLE)
 
         self._build_ui()
@@ -447,8 +468,15 @@ class MainWindow(QMainWindow):
     # ── UI 구성 ────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
+        # 스크롤 가능한 중앙 위젯
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setCentralWidget(scroll)
+
         central = QWidget()
-        self.setCentralWidget(central)
+        scroll.setWidget(central)
         root = QVBoxLayout(central)
         root.setSpacing(12)
         root.setContentsMargins(16, 16, 16, 16)
