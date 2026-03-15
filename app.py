@@ -17,7 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QGroupBox,
@@ -279,6 +279,35 @@ class VoiceDesignTab(QWidget):
         }
 
 
+class YouTubeWorker(QThread):
+    """YouTube 다운로드 + Whisper 전사를 백그라운드 스레드에서 실행."""
+
+    progress = Signal(str)
+    finished = Signal(str, str)  # (wav_path, transcribed_text)
+    error = Signal(str)
+
+    def __init__(self, url: str, max_duration: int = 30) -> None:
+        super().__init__()
+        self._url = url
+        self._max_duration = max_duration
+
+    def run(self) -> None:
+        try:
+            wav_path = download_youtube_audio(
+                self._url,
+                max_duration=self._max_duration,
+                progress_cb=lambda msg: self.progress.emit(msg),
+            )
+            self.progress.emit("Whisper 전사 시작...")
+            text = transcribe_audio(
+                wav_path,
+                progress_cb=lambda msg: self.progress.emit(msg),
+            )
+            self.finished.emit(str(wav_path), text or "")
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class VoiceCloneTab(QWidget):
     ref_audio_path: str | None = None
 
@@ -291,6 +320,7 @@ class VoiceCloneTab(QWidget):
         self._rec_timer = QTimer()
         self._rec_timer.timeout.connect(self._update_rec_time)
         self._rec_start = 0.0
+        self._yt_worker: YouTubeWorker | None = None
 
         # 레퍼런스 오디오
         ref_group = QGroupBox("🎵 레퍼런스 오디오 (3초 이상 권장)")
@@ -413,7 +443,7 @@ class VoiceCloneTab(QWidget):
                 self.rec_label.setStyleSheet(f"color: {MUTED};")
 
     def _download_youtube(self) -> None:
-        """YouTube URL에서 오디오 다운로드 + Whisper 자동 전사."""
+        """YouTube URL에서 오디오 다운로드 + Whisper 자동 전사 (백그라운드 스레드)."""
         url = self.yt_url_edit.text().strip()
         if not url:
             QMessageBox.warning(self, "URL 필요", "YouTube URL을 입력하세요.")
@@ -422,34 +452,34 @@ class VoiceCloneTab(QWidget):
         self.yt_download_btn.setEnabled(False)
         self.yt_status_label.setText("다운로드 중...")
         self.yt_status_label.setStyleSheet(f"color: {WARNING};")
-        QApplication.processEvents()
 
-        def _progress(msg: str) -> None:
-            self.yt_status_label.setText(msg)
-            QApplication.processEvents()
+        self._yt_worker = YouTubeWorker(url, max_duration=30)
+        self._yt_worker.progress.connect(self._on_yt_progress)
+        self._yt_worker.finished.connect(self._on_yt_finished)
+        self._yt_worker.error.connect(self._on_yt_error)
+        self._yt_worker.start()
 
-        try:
-            wav_path = download_youtube_audio(url, max_duration=30, progress_cb=_progress)
-            self.ref_audio_path = str(wav_path)
-            self.file_label.setText(f"YouTube: {Path(url).name[:30]}")
-            self.file_label.setStyleSheet(f"color: {SUCCESS};")
-            self.clear_btn.setEnabled(True)
+    def _on_yt_progress(self, msg: str) -> None:
+        self.yt_status_label.setText(msg)
 
-            # Whisper 자동 전사
-            _progress("Whisper 전사 시작...")
-            text = transcribe_audio(wav_path, progress_cb=_progress)
-            if text:
-                self.ref_text_edit.setPlainText(text)
-                self.yt_status_label.setText(f"완료 — 오디오 + 텍스트 자동 입력됨")
-                self.yt_status_label.setStyleSheet(f"color: {SUCCESS};")
-            else:
-                self.yt_status_label.setText("오디오 다운로드 완료 (텍스트 인식 실패 — 수동 입력)")
-                self.yt_status_label.setStyleSheet(f"color: {WARNING};")
-        except Exception as e:
-            self.yt_status_label.setText(f"오류: {e}")
-            self.yt_status_label.setStyleSheet(f"color: {DANGER};")
-        finally:
-            self.yt_download_btn.setEnabled(True)
+    def _on_yt_finished(self, wav_path: str, text: str) -> None:
+        self.ref_audio_path = wav_path
+        self.file_label.setText(f"YouTube: {Path(wav_path).stem[:30]}")
+        self.file_label.setStyleSheet(f"color: {SUCCESS};")
+        self.clear_btn.setEnabled(True)
+        self.yt_download_btn.setEnabled(True)
+        if text:
+            self.ref_text_edit.setPlainText(text)
+            self.yt_status_label.setText("완료 — 오디오 + 텍스트 자동 입력됨")
+            self.yt_status_label.setStyleSheet(f"color: {SUCCESS};")
+        else:
+            self.yt_status_label.setText("오디오 다운로드 완료 (텍스트 인식 실패 — 수동 입력)")
+            self.yt_status_label.setStyleSheet(f"color: {WARNING};")
+
+    def _on_yt_error(self, err: str) -> None:
+        self.yt_status_label.setText(f"오류: {err}")
+        self.yt_status_label.setStyleSheet(f"color: {DANGER};")
+        self.yt_download_btn.setEnabled(True)
 
     def _update_rec_time(self) -> None:
         elapsed = int(time.time() - self._rec_start)

@@ -170,6 +170,8 @@ class Qwen3TTSEngine:
                     model.model = model.model.to(
                         device=self.device, dtype=self.dtype,
                     )
+                    # 래퍼의 device도 업데이트 (생성 시 input_ids를 이 device로 이동)
+                    model.device = torch.device(self.device)
                     self._model = model
                 else:
                     self._model = Qwen3TTSModel.from_pretrained(

@@ -202,30 +202,40 @@ def download_youtube_audio(
     _report("YouTube 오디오 다운로드 중...")
     import subprocess
 
-    # yt-dlp로 오디오만 추출 (최대 max_duration초)
-    cmd = [
+    # 1단계: yt-dlp로 베스트 오디오 다운로드
+    dl_path = Path(tmp_dir) / "audio"
+    cmd_dl = [
         "yt-dlp",
         "--no-playlist",
-        "--extract-audio",
-        "--audio-format", "wav",
-        "--audio-quality", "0",
-        "--postprocessor-args", f"ffmpeg:-ac 1 -ar {SAMPLE_RATE} -t {max_duration}",
-        "-o", str(tmp_audio),
+        "-x",
+        "--audio-format", "best",
+        "-o", str(dl_path) + ".%(ext)s",
         url,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(cmd_dl, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         raise RuntimeError(f"yt-dlp 다운로드 실패:\n{result.stderr[:500]}")
 
-    # 다운로드된 wav 파일 찾기
-    wav_files = list(Path(tmp_dir).glob("audio.*"))
-    if not wav_files:
+    # 다운로드된 파일 찾기
+    dl_files = list(Path(tmp_dir).glob("audio.*"))
+    if not dl_files:
         raise RuntimeError("다운로드된 오디오 파일을 찾을 수 없습니다.")
 
-    # 최종 wav로 복사
+    # 2단계: ffmpeg로 mono wav 변환 + 길이 제한
     final_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     final_wav.close()
-    shutil.move(str(wav_files[0]), final_wav.name)
+    _report("오디오 변환 중 (wav)...")
+    cmd_ff = [
+        "ffmpeg", "-y",
+        "-i", str(dl_files[0]),
+        "-ac", "1",
+        "-ar", str(SAMPLE_RATE),
+        "-t", str(max_duration),
+        final_wav.name,
+    ]
+    ff_result = subprocess.run(cmd_ff, capture_output=True, text=True, timeout=60)
+    if ff_result.returncode != 0:
+        raise RuntimeError(f"ffmpeg 변환 실패:\n{ff_result.stderr[:500]}")
 
     # 임시 디렉토리 정리
     shutil.rmtree(tmp_dir, ignore_errors=True)
