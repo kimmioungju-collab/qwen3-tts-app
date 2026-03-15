@@ -6,8 +6,10 @@ Qwen3-TTS Mac App
 from __future__ import annotations
 
 import os
-# Mac: PyTorch + numpy가 각각 다른 libomp를 링크하여 충돌하는 문제 방지
+# Mac: PyTorch + numpy + Qt가 각각 다른 libomp를 링크하여 충돌하는 문제 방지
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import shutil
 import sys
@@ -15,7 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QGroupBox,
@@ -155,50 +157,10 @@ QStatusBar {{ color: {MUTED}; }}
 """
 
 
-# ── 워커 스레드 ─────────────────────────────────────────────────────────────
+# ── 워커 ────────────────────────────────────────────────────────────────────
+# NOTE: 스레드(QThread/threading) + transformers의 _load_state_dict_into_meta_model이
+#       MPS에서 세그폴트 유발. 메인 스레드 동기 실행 + processEvents()로 UI 응답 유지.
 
-
-class LoadWorker(QThread):
-    progress = Signal(str)
-    done     = Signal()
-    error    = Signal(str)
-
-    def __init__(self, engine: Qwen3TTSEngine, model_key: str) -> None:
-        super().__init__()
-        self.engine = engine
-        self.model_key = model_key
-
-    def run(self) -> None:
-        try:
-            self.engine.load_model(self.model_key, self.progress.emit)
-            self.done.emit()
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class GenerateWorker(QThread):
-    done  = Signal(object, int)   # (np.ndarray, sample_rate)
-    error = Signal(str)
-
-    def __init__(self, engine: Qwen3TTSEngine, mode: str, kwargs: dict) -> None:
-        super().__init__()
-        self.engine = engine
-        self.mode   = mode
-        self.kwargs = kwargs
-
-    def run(self) -> None:
-        try:
-            if self.mode == "custom":
-                audio, sr = self.engine.generate_custom_voice(**self.kwargs)
-            elif self.mode == "design":
-                audio, sr = self.engine.generate_voice_design(**self.kwargs)
-            elif self.mode == "clone":
-                audio, sr = self.engine.generate_voice_clone(**self.kwargs)
-            else:
-                raise ValueError(f"알 수 없는 모드: {self.mode}")
-            self.done.emit(audio, sr)
-        except Exception as e:
-            self.error.emit(str(e))
 
 
 # ── 탭 위젯들 ──────────────────────────────────────────────────────────────
@@ -473,8 +435,6 @@ class MainWindow(QMainWindow):
         self.engine = Qwen3TTSEngine()
         self.player = Player()
         self._last_wav: Path | None = None
-        self._load_worker: LoadWorker | None = None
-        self._gen_worker: GenerateWorker | None = None
 
         self.setWindowTitle("Qwen3-TTS Voice Studio")
         self.setMinimumSize(800, 600)
@@ -620,10 +580,19 @@ class MainWindow(QMainWindow):
         compatible = MODE_MODELS.get(mode, list(MODELS.keys()))
         default = MODE_DEFAULT_MODEL.get(mode, compatible[0])
 
+        # 로드된 모델이 새 탭에도 호환되면 그 모델을 선택, 아니면 기본값
+        selected = default
+        if self.engine.is_loaded:
+            loaded_id = self.engine._current_model_id
+            for key in compatible:
+                if MODELS[key] == loaded_id:
+                    selected = key
+                    break
+
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
         self.model_combo.addItems(compatible)
-        self.model_combo.setCurrentText(default)
+        self.model_combo.setCurrentText(selected)
         self.model_combo.blockSignals(False)
 
         # 이미 로드된 모델이 호환되는지 표시
@@ -633,6 +602,7 @@ class MainWindow(QMainWindow):
             if loaded_id in compatible_ids:
                 self.model_status_label.setText("✅ 로드된 모델 호환")
                 self.model_status_label.setStyleSheet(f"color: {SUCCESS};")
+                self.gen_btn.setEnabled(True)
             else:
                 self.model_status_label.setText("⚠️ 로드된 모델 비호환 — 다시 로드 필요")
                 self.model_status_label.setStyleSheet(f"color: {WARNING};")
@@ -643,39 +613,49 @@ class MainWindow(QMainWindow):
     # ── 모델 로드 ──────────────────────────────────────────────────────────
 
     def _load_model(self) -> None:
+        """메인 스레드에서 동기 로드 (스레드 + transformers = MPS 세그폴트)."""
         model_key = self.model_combo.currentText()
         self.load_btn.setEnabled(False)
         self.gen_btn.setEnabled(False)
         self.load_progress.setVisible(True)
         self.load_log.setText("로드 준비 중...")
+        QApplication.processEvents()
 
-        self._load_worker = LoadWorker(self.engine, model_key)
-        self._load_worker.progress.connect(self.load_log.setText)
-        self._load_worker.done.connect(self._on_load_done)
-        self._load_worker.error.connect(self._on_load_error)
-        self._load_worker.start()
+        def _progress(msg: str) -> None:
+            self.load_log.setText(msg)
+            QApplication.processEvents()
 
-    def _on_load_done(self) -> None:
-        self.load_progress.setVisible(False)
-        self.load_btn.setEnabled(True)
-        self.load_log.setText("✅ 모델 로드 완료")
-        self.load_log.setStyleSheet(f"color: {SUCCESS};")
-        self.status_bar.showMessage("준비됨 — 텍스트 입력 후 음성 생성을 클릭하세요.")
-        # 현재 탭 호환성 재확인 후 생성 버튼 활성화
-        self._on_tab_changed(self.tabs.currentIndex())
-        mode = self._current_mode()
-        compatible_ids = [MODELS[k] for k in MODE_MODELS.get(mode, [])]
-        if self.engine._current_model_id in compatible_ids:
-            self.gen_btn.setEnabled(True)
-        else:
-            self.gen_btn.setEnabled(False)
+        try:
+            self.engine.load_model(model_key, _progress)
+            # 성공 — 콤보를 로드된 모델로 유지 (_on_tab_changed 호출 시 기본값으로 리셋되므로 직접 설정)
+            self.load_progress.setVisible(False)
+            self.load_btn.setEnabled(True)
+            self.load_log.setText(f"✅ 모델 로드 완료: {model_key}")
+            self.load_log.setStyleSheet(f"color: {SUCCESS};")
+            self.status_bar.showMessage("준비됨 — 텍스트 입력 후 음성 생성을 클릭하세요.")
 
-    def _on_load_error(self, err: str) -> None:
-        self.load_progress.setVisible(False)
-        self.load_btn.setEnabled(True)
-        self.load_log.setText(f"❌ {err}")
-        self.load_log.setStyleSheet(f"color: {DANGER};")
-        QMessageBox.critical(self, "모델 로드 실패", err)
+            # 콤보를 로드된 모델로 설정 (리셋 방지)
+            self.model_combo.blockSignals(True)
+            self.model_combo.setCurrentText(model_key)
+            self.model_combo.blockSignals(False)
+
+            # 호환성 검증 후 생성 버튼 활성화
+            mode = self._current_mode()
+            compatible_ids = [MODELS[k] for k in MODE_MODELS.get(mode, [])]
+            is_compatible = self.engine._current_model_id in compatible_ids
+            self.gen_btn.setEnabled(is_compatible)
+            if is_compatible:
+                self.model_status_label.setText("✅ 로드된 모델 호환")
+                self.model_status_label.setStyleSheet(f"color: {SUCCESS};")
+            else:
+                self.model_status_label.setText("⚠️ 로드된 모델 비호환 — 다시 로드 필요")
+                self.model_status_label.setStyleSheet(f"color: {WARNING};")
+        except Exception as e:
+            self.load_progress.setVisible(False)
+            self.load_btn.setEnabled(True)
+            self.load_log.setText(f"❌ {e}")
+            self.load_log.setStyleSheet(f"color: {DANGER};")
+            QMessageBox.critical(self, "모델 로드 실패", str(e))
 
     # ── 음성 생성 ──────────────────────────────────────────────────────────
 
@@ -729,33 +709,36 @@ class MainWindow(QMainWindow):
         self.result_label.setText("생성 중...")
         self.play_btn.setEnabled(False)
         self.download_btn.setEnabled(False)
+        QApplication.processEvents()
 
-        self._gen_worker = GenerateWorker(self.engine, mode, kwargs)
-        self._gen_worker.done.connect(self._on_gen_done)
-        self._gen_worker.error.connect(self._on_gen_error)
-        self._gen_worker.start()
+        try:
+            if mode == "custom":
+                audio, sr = self.engine.generate_custom_voice(**kwargs)
+            elif mode == "design":
+                audio, sr = self.engine.generate_voice_design(**kwargs)
+            elif mode == "clone":
+                audio, sr = self.engine.generate_voice_clone(**kwargs)
+            else:
+                raise ValueError(f"알 수 없는 모드: {mode}")
 
-    def _on_gen_done(self, audio: object, sr: int) -> None:
-        self.gen_progress.setVisible(False)
-        self.gen_btn.setEnabled(True)
+            audio_arr = np.array(audio)
+            self._last_wav = numpy_to_wav(audio_arr, sr)
+            duration = len(audio_arr) / sr
 
-        audio_arr = np.array(audio)
-        self._last_wav = numpy_to_wav(audio_arr, sr)
-
-        duration = len(audio_arr) / sr
-        self.result_label.setText(f"✅ 생성 완료 — {duration:.1f}초")
-        self.result_label.setStyleSheet(f"color: {SUCCESS};")
-        self.play_btn.setEnabled(True)
-        self.download_btn.setEnabled(True)
-        self.status_bar.showMessage(f"음성 생성 완료 ({duration:.1f}초)")
-
-    def _on_gen_error(self, err: str) -> None:
-        self.gen_progress.setVisible(False)
-        self.gen_btn.setEnabled(True)
-        self.result_label.setText("❌ 생성 실패 — 아래 오류 확인")
-        self.result_label.setStyleSheet(f"color: {DANGER};")
-        self.status_bar.showMessage("생성 실패")
-        QMessageBox.critical(self, "생성 오류", f"음성 생성 중 오류가 발생했습니다:\n\n{err}")
+            self.gen_progress.setVisible(False)
+            self.gen_btn.setEnabled(True)
+            self.result_label.setText(f"✅ 생성 완료 — {duration:.1f}초")
+            self.result_label.setStyleSheet(f"color: {SUCCESS};")
+            self.play_btn.setEnabled(True)
+            self.download_btn.setEnabled(True)
+            self.status_bar.showMessage(f"음성 생성 완료 ({duration:.1f}초)")
+        except Exception as e:
+            self.gen_progress.setVisible(False)
+            self.gen_btn.setEnabled(True)
+            self.result_label.setText("❌ 생성 실패 — 아래 오류 확인")
+            self.result_label.setStyleSheet(f"color: {DANGER};")
+            self.status_bar.showMessage("생성 실패")
+            QMessageBox.critical(self, "생성 오류", f"음성 생성 중 오류가 발생했습니다:\n\n{e}")
 
     # ── 재생 & 다운로드 ────────────────────────────────────────────────────
 

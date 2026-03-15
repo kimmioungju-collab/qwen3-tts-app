@@ -157,13 +157,14 @@ class Qwen3TTSEngine:
                 from qwen_tts import Qwen3TTSModel
 
                 if self.device == "mps":
-                    # MPS: accelerate의 device_map 로딩이 세그폴트 유발
-                    # → device_map 없이 CPU 로드 후 수동 이동
+                    # MPS: accelerate의 meta-device 로딩(_load_state_dict_into_meta_model)이
+                    # 세그폴트 유발 → low_cpu_mem_usage=False로 구식 로딩 강제
                     _report("CPU에 모델 로드 중... (MPS 안정성 우회)")
                     model = Qwen3TTSModel.from_pretrained(
                         model_id,
-                        torch_dtype=torch.float32,
+                        dtype=torch.float32,
                         attn_implementation=self.attn,
+                        low_cpu_mem_usage=False,
                     )
                     _report(f"MPS로 이동 중 (dtype={self.dtype})...")
                     model.model = model.model.to(
@@ -174,7 +175,7 @@ class Qwen3TTSEngine:
                     self._model = Qwen3TTSModel.from_pretrained(
                         model_id,
                         device_map=self.device,
-                        torch_dtype=self.dtype,
+                        dtype=self.dtype,
                         attn_implementation=self.attn,
                     )
                 self._current_model_id = model_id
