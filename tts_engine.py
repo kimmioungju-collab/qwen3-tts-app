@@ -12,6 +12,15 @@ from typing import Callable
 import numpy as np
 import torch
 
+# MPS float16에서 multinomial 샘플링 시 NaN/inf 발생하는 문제 패치
+_orig_multinomial = torch.multinomial
+def _safe_multinomial(input, num_samples, replacement=False, **kwargs):
+    input = torch.nan_to_num(input, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0)
+    if input.sum() == 0:
+        input = torch.ones_like(input)
+    return _orig_multinomial(input, num_samples, replacement=replacement, **kwargs)
+torch.multinomial = _safe_multinomial
+
 # ── 디바이스 / dtype 자동 감지 ─────────────────────────────────────────────
 
 

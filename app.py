@@ -332,6 +332,10 @@ class VoiceCloneTab(QWidget):
         self.upload_btn = QPushButton("📂 파일 업로드")
         self.upload_btn.clicked.connect(self._upload_file)
         file_row.addWidget(self.upload_btn)
+        self.clear_btn = QPushButton("✕ 취소")
+        self.clear_btn.setEnabled(False)
+        self.clear_btn.clicked.connect(self._clear_file)
+        file_row.addWidget(self.clear_btn)
         ref_layout.addLayout(file_row)
 
         # 읽을 문장 안내
@@ -402,8 +406,15 @@ class VoiceCloneTab(QWidget):
             self.ref_audio_path = str(wav_path)
             self.file_label.setText(Path(path).name)
             self.file_label.setStyleSheet(f"color: {SUCCESS};")
+            self.clear_btn.setEnabled(True)
         except Exception as e:
             QMessageBox.warning(self, "변환 오류", str(e))
+
+    def _clear_file(self) -> None:
+        self.ref_audio_path = None
+        self.file_label.setText("파일 없음")
+        self.file_label.setStyleSheet(f"color: {MUTED};")
+        self.clear_btn.setEnabled(False)
 
     def _toggle_record(self) -> None:
         if not self.recorder.is_recording:
@@ -425,7 +436,7 @@ class VoiceCloneTab(QWidget):
                 tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                 tmp.close()
                 import soundfile as sf
-                sf.write(tmp.name, audio, 44100)
+                sf.write(tmp.name, audio, 16000)
                 self.ref_audio_path = tmp.name
                 self.rec_label.setText(f"녹음 완료 ({len(audio)/44100:.1f}초)")
                 self.rec_label.setStyleSheet(f"color: {SUCCESS};")

@@ -17,7 +17,7 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-SAMPLE_RATE = 44_100
+SAMPLE_RATE = 16_000
 CHANNELS = 1
 DTYPE = "float32"
 
