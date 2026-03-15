@@ -5,6 +5,10 @@ Qwen3-TTS Mac App
 """
 from __future__ import annotations
 
+import os
+# Mac: PyTorch + numpy가 각각 다른 libomp를 링크하여 충돌하는 문제 방지
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import shutil
 import sys
 import tempfile
@@ -22,8 +26,11 @@ from PySide6.QtWidgets import (
 
 import numpy as np
 
-from audio_utils import Player, Recorder, any_to_wav, numpy_to_wav, wav_to_m4a
-from tts_engine import LANGUAGES, MODELS, SPEAKERS, Qwen3TTSEngine
+from audio_utils import SAMPLE_RATE, Player, Recorder, any_to_wav, numpy_to_wav, wav_to_m4a
+from tts_engine import (
+    LANGUAGES, MODE_DEFAULT_MODEL, MODE_MODELS, MODELS, SPEAKERS,
+    Qwen3TTSEngine,
+)
 
 
 # ── 스타일 상수 ─────────────────────────────────────────────────────────────
@@ -41,7 +48,7 @@ STYLE = f"""
 QMainWindow, QWidget {{
     background-color: {DARK_BG};
     color: {TEXT};
-    font-family: -apple-system, "SF Pro Text", "Helvetica Neue";
+    font-family: "Helvetica Neue";
     font-size: 13px;
 }}
 QTabWidget::pane {{
@@ -436,9 +443,9 @@ class VoiceCloneTab(QWidget):
                 tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                 tmp.close()
                 import soundfile as sf
-                sf.write(tmp.name, audio, 16000)
+                sf.write(tmp.name, audio, SAMPLE_RATE)
                 self.ref_audio_path = tmp.name
-                self.rec_label.setText(f"녹음 완료 ({len(audio)/44100:.1f}초)")
+                self.rec_label.setText(f"녹음 완료 ({len(audio)/SAMPLE_RATE:.1f}초)")
                 self.rec_label.setStyleSheet(f"color: {SUCCESS};")
             else:
                 self.rec_label.setText("녹음 없음")
@@ -475,6 +482,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._update_device_label()
+        # 초기 탭에 맞는 모델 목록으로 시작
+        self._on_tab_changed(self.tabs.currentIndex())
 
     # ── UI 구성 ────────────────────────────────────────────────────────────
 
@@ -507,8 +516,6 @@ class MainWindow(QMainWindow):
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel("모델:"))
         self.model_combo = QComboBox()
-        self.model_combo.addItems(MODELS.keys())
-        self.model_combo.setCurrentText("0.6B-Base (경량 클론)")
         self.model_combo.setMinimumWidth(260)
         model_row.addWidget(self.model_combo)
 
@@ -516,6 +523,10 @@ class MainWindow(QMainWindow):
         self.load_btn.setObjectName("primary")
         self.load_btn.clicked.connect(self._load_model)
         model_row.addWidget(self.load_btn)
+
+        self.model_status_label = QLabel("")
+        self.model_status_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        model_row.addWidget(self.model_status_label)
         model_row.addStretch()
         root.addLayout(model_row)
 
@@ -544,6 +555,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.clone_tab,   "🔄 Voice Clone")
         root.addWidget(self.tabs)
 
+        # 탭 인덱스 → 모드 이름 (시그널 연결 전에 정의)
+        self._tab_modes = {0: "custom", 1: "design", 2: "clone"}
+
         # ── 생성 버튼 ──────────────────────────────────────────────────────
         gen_row = QHBoxLayout()
         self.gen_btn = QPushButton("▶ 음성 생성")
@@ -552,6 +566,10 @@ class MainWindow(QMainWindow):
         self.gen_btn.setEnabled(False)
         self.gen_btn.clicked.connect(self._generate)
         gen_row.addWidget(self.gen_btn, 1)
+
+        # gen_btn 생성 후 탭 시그널 연결 & 초기 탭 설정
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.setCurrentIndex(2)  # Voice Clone 기본 선택
 
         self.gen_progress = QProgressBar()
         self.gen_progress.setRange(0, 0)
@@ -583,13 +601,44 @@ class MainWindow(QMainWindow):
         # ── 상태바 ─────────────────────────────────────────────────────────
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("모델을 먼저 로드하세요.")
+        self.status_bar.showMessage("모드 탭을 선택하고 모델을 로드하세요.")
 
     # ── 디바이스 레이블 ────────────────────────────────────────────────────
 
     def _update_device_label(self) -> None:
         info = self.engine.device_info()
         self.device_label.setText(f"🖥 {info}")
+
+    # ── 탭-모델 연동 ──────────────────────────────────────────────────────
+
+    def _current_mode(self) -> str:
+        return self._tab_modes.get(self.tabs.currentIndex(), "custom")
+
+    def _on_tab_changed(self, index: int) -> None:
+        """탭 전환 시 호환 모델 목록으로 콤보 교체 + 자동 선택."""
+        mode = self._tab_modes.get(index, "custom")
+        compatible = MODE_MODELS.get(mode, list(MODELS.keys()))
+        default = MODE_DEFAULT_MODEL.get(mode, compatible[0])
+
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        self.model_combo.addItems(compatible)
+        self.model_combo.setCurrentText(default)
+        self.model_combo.blockSignals(False)
+
+        # 이미 로드된 모델이 호환되는지 표시
+        if self.engine.is_loaded:
+            loaded_id = self.engine._current_model_id
+            compatible_ids = [MODELS[k] for k in compatible]
+            if loaded_id in compatible_ids:
+                self.model_status_label.setText("✅ 로드된 모델 호환")
+                self.model_status_label.setStyleSheet(f"color: {SUCCESS};")
+            else:
+                self.model_status_label.setText("⚠️ 로드된 모델 비호환 — 다시 로드 필요")
+                self.model_status_label.setStyleSheet(f"color: {WARNING};")
+                self.gen_btn.setEnabled(False)
+        else:
+            self.model_status_label.setText("")
 
     # ── 모델 로드 ──────────────────────────────────────────────────────────
 
@@ -609,10 +658,17 @@ class MainWindow(QMainWindow):
     def _on_load_done(self) -> None:
         self.load_progress.setVisible(False)
         self.load_btn.setEnabled(True)
-        self.gen_btn.setEnabled(True)
         self.load_log.setText("✅ 모델 로드 완료")
         self.load_log.setStyleSheet(f"color: {SUCCESS};")
         self.status_bar.showMessage("준비됨 — 텍스트 입력 후 음성 생성을 클릭하세요.")
+        # 현재 탭 호환성 재확인 후 생성 버튼 활성화
+        self._on_tab_changed(self.tabs.currentIndex())
+        mode = self._current_mode()
+        compatible_ids = [MODELS[k] for k in MODE_MODELS.get(mode, [])]
+        if self.engine._current_model_id in compatible_ids:
+            self.gen_btn.setEnabled(True)
+        else:
+            self.gen_btn.setEnabled(False)
 
     def _on_load_error(self, err: str) -> None:
         self.load_progress.setVisible(False)
@@ -629,6 +685,24 @@ class MainWindow(QMainWindow):
 
         if not text:
             QMessageBox.warning(self, "입력 필요", "합성할 텍스트를 입력하세요.")
+            return
+
+        if not self.engine.is_loaded:
+            QMessageBox.warning(self, "모델 미로드", "먼저 모델을 로드하세요.")
+            return
+
+        # 모델-모드 호환성 검증
+        mode = self._current_mode()
+        compatible_ids = [MODELS[k] for k in MODE_MODELS.get(mode, [])]
+        if self.engine._current_model_id not in compatible_ids:
+            mode_labels = {"custom": "Custom Voice", "design": "Voice Design", "clone": "Voice Clone"}
+            compatible_names = "\n".join(f"  • {k}" for k in MODE_MODELS.get(mode, []))
+            QMessageBox.warning(
+                self, "모델 비호환",
+                f"{mode_labels.get(mode, mode)} 모드에는 다음 모델이 필요합니다:\n\n"
+                f"{compatible_names}\n\n"
+                f"모델을 다시 로드해주세요.",
+            )
             return
 
         tab = self.tabs.currentIndex()
@@ -678,10 +752,10 @@ class MainWindow(QMainWindow):
     def _on_gen_error(self, err: str) -> None:
         self.gen_progress.setVisible(False)
         self.gen_btn.setEnabled(True)
-        self.result_label.setText(f"❌ 오류")
+        self.result_label.setText("❌ 생성 실패 — 아래 오류 확인")
         self.result_label.setStyleSheet(f"color: {DANGER};")
         self.status_bar.showMessage("생성 실패")
-        QMessageBox.critical(self, "생성 오류", err)
+        QMessageBox.critical(self, "생성 오류", f"음성 생성 중 오류가 발생했습니다:\n\n{err}")
 
     # ── 재생 & 다운로드 ────────────────────────────────────────────────────
 
@@ -721,20 +795,28 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
-    # 환경 사전 체크
+    # 환경 사전 체크 (GUI 실행은 차단하지 않음)
     from env_check import run_checks
     report = run_checks()
     print(report.summary())
-
-    if report.has_critical:
-        print("\n❌ 필수 항목 오류 — setup_env.sh 실행 후 재시도하세요.")
-        sys.exit(1)
 
     app = QApplication(sys.argv)
     app.setApplicationName("Qwen3-TTS Voice Studio")
 
     win = MainWindow()
     win.show()
+
+    # critical 오류가 있으면 GUI 안에서 경고 표시 (앱은 띄운 상태로)
+    if report.has_critical:
+        missing = [r for r in report.results if r.status == "FAIL"]
+        details = "\n".join(f"  • {r.name}: {r.message}\n    → {r.fix}" for r in missing)
+        QMessageBox.warning(
+            win, "환경 설정 필요",
+            f"일부 필수 패키지가 누락되었습니다:\n\n{details}\n\n"
+            f"설치 후 앱을 재시작하세요.\n"
+            f"(모델 로드 시 오류가 발생할 수 있습니다)",
+        )
+
     sys.exit(app.exec())
 
 
