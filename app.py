@@ -5,6 +5,7 @@ Qwen3-TTS Mac App
 """
 from __future__ import annotations
 
+import json
 import os
 # Mac: PyTorch + numpy + Qt가 각각 다른 libomp를 링크하여 충돌하는 문제 방지
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -21,9 +22,9 @@ from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStatusBar,
-    QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
+    QStatusBar, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 import numpy as np
@@ -48,6 +49,8 @@ MUTED    = "#6C7086"
 SUCCESS  = "#A6E3A1"
 WARNING  = "#FAB387"
 DANGER   = "#F38BA8"
+
+VOICES_DIR = Path(__file__).resolve().parent / "voices"
 
 STYLE = f"""
 QMainWindow, QWidget {{
@@ -322,6 +325,24 @@ class VoiceCloneTab(QWidget):
         self._rec_start = 0.0
         self._yt_worker: YouTubeWorker | None = None
 
+        # 저장된 목소리
+        saved_group = QGroupBox("📂 저장된 목소리")
+        saved_layout = QHBoxLayout(saved_group)
+        self.voice_combo = QComboBox()
+        self.voice_combo.setMinimumWidth(200)
+        self.voice_combo.currentTextChanged.connect(self._on_voice_selected)
+        saved_layout.addWidget(self.voice_combo, 1)
+        self.save_voice_btn = QPushButton("💾 현재 목소리 저장")
+        self.save_voice_btn.clicked.connect(self._save_voice)
+        saved_layout.addWidget(self.save_voice_btn)
+        self.del_voice_btn = QPushButton("🗑")
+        self.del_voice_btn.setFixedWidth(36)
+        self.del_voice_btn.setToolTip("선택한 목소리 삭제")
+        self.del_voice_btn.clicked.connect(self._delete_voice)
+        saved_layout.addWidget(self.del_voice_btn)
+        layout.addWidget(saved_group)
+        self._refresh_voice_list()
+
         # 레퍼런스 오디오
         ref_group = QGroupBox("🎵 레퍼런스 오디오 (3초 이상 권장)")
         ref_layout = QVBoxLayout(ref_group)
@@ -480,6 +501,132 @@ class VoiceCloneTab(QWidget):
         self.yt_status_label.setText(f"오류: {err}")
         self.yt_status_label.setStyleSheet(f"color: {DANGER};")
         self.yt_download_btn.setEnabled(True)
+
+    # ── 저장된 목소리 관리 ──────────────────────────────────────────────────
+
+    def _refresh_voice_list(self) -> None:
+        """voices/ 디렉토리 스캔하여 콤보 갱신."""
+        self.voice_combo.blockSignals(True)
+        self.voice_combo.clear()
+        self.voice_combo.addItem("— 새로 만들기 —")
+        VOICES_DIR.mkdir(parents=True, exist_ok=True)
+        for d in sorted(VOICES_DIR.iterdir()):
+            config_path = d / "config.json"
+            if not config_path.is_file():
+                continue
+            try:
+                cfg = json.loads(config_path.read_text(encoding="utf-8"))
+                label = cfg.get("display_name", d.name)
+                self.voice_combo.addItem(label, userData=d.name)
+            except (json.JSONDecodeError, OSError):
+                continue
+        self.voice_combo.blockSignals(False)
+        self.del_voice_btn.setEnabled(self.voice_combo.currentIndex() > 0)
+
+    def _on_voice_selected(self, text: str) -> None:
+        """콤보 선택 변경 시 프로필 로드 또는 초기화."""
+        idx = self.voice_combo.currentIndex()
+        self.del_voice_btn.setEnabled(idx > 0)
+        if idx <= 0:
+            return
+        voice_name = self.voice_combo.currentData()
+        if not voice_name:
+            return
+        self._load_saved_voice(voice_name)
+
+    def _load_saved_voice(self, name: str) -> None:
+        """저장된 목소리 프로필 로드 → ref_audio + ref_text 자동 채움."""
+        voice_dir = VOICES_DIR / name
+        config_path = voice_dir / "config.json"
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            QMessageBox.warning(self, "로드 실패", str(e))
+            return
+
+        audio_path = voice_dir / cfg.get("reference_audio", "reference.wav")
+        if not audio_path.exists():
+            QMessageBox.warning(self, "오류", f"오디오 파일 없음: {audio_path}")
+            return
+
+        self.ref_audio_path = str(audio_path)
+        self.file_label.setText(f"📂 {cfg.get('display_name', name)}")
+        self.file_label.setStyleSheet(f"color: {SUCCESS};")
+        self.clear_btn.setEnabled(True)
+        ref_text = cfg.get("reference_text", "")
+        if ref_text:
+            self.ref_text_edit.setPlainText(ref_text)
+
+    def _save_voice(self) -> None:
+        """현재 ref_audio + ref_text를 목소리 프로필로 저장."""
+        if not self.ref_audio_path:
+            QMessageBox.warning(self, "저장 불가", "레퍼런스 오디오를 먼저 설정하세요.")
+            return
+
+        name, ok = QInputDialog.getText(
+            self, "목소리 저장", "프로필 이름 (영문/한글):"
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        # 표시 이름 입력
+        display_name, ok = QInputDialog.getText(
+            self, "표시 이름", "목소리 설명 (예: '은우 목소리'):",
+            text=name,
+        )
+        if not ok:
+            return
+
+        voice_dir = VOICES_DIR / name
+        voice_dir.mkdir(parents=True, exist_ok=True)
+
+        # wav 복사
+        dst_wav = voice_dir / "reference.wav"
+        shutil.copy2(self.ref_audio_path, dst_wav)
+
+        # config 저장
+        config = {
+            "name": name,
+            "display_name": display_name or name,
+            "reference_audio": "reference.wav",
+            "reference_text": self.ref_text_edit.toPlainText().strip(),
+            "language": "Korean",
+            "description": f"{display_name or name} 목소리",
+        }
+        (voice_dir / "config.json").write_text(
+            json.dumps(config, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        self._refresh_voice_list()
+        # 방금 저장한 프로필 선택
+        for i in range(self.voice_combo.count()):
+            if self.voice_combo.itemData(i) == name:
+                self.voice_combo.setCurrentIndex(i)
+                break
+
+        QMessageBox.information(self, "저장 완료", f"'{display_name}' 저장됨")
+
+    def _delete_voice(self) -> None:
+        """선택된 목소리 프로필 삭제."""
+        idx = self.voice_combo.currentIndex()
+        if idx <= 0:
+            return
+        voice_name = self.voice_combo.currentData()
+        display = self.voice_combo.currentText()
+
+        reply = QMessageBox.question(
+            self, "삭제 확인",
+            f"'{display}'을(를) 삭제하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        voice_dir = VOICES_DIR / voice_name
+        shutil.rmtree(voice_dir, ignore_errors=True)
+        self._refresh_voice_list()
 
     def _update_rec_time(self) -> None:
         elapsed = int(time.time() - self._rec_start)
