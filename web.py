@@ -3,6 +3,9 @@
 Qwen3-TTS 웹 GUI (Gradio)
 PySide6 대신 브라우저 기반 인터페이스
 """
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import json
 import gradio as gr
 from pathlib import Path
@@ -48,10 +51,9 @@ def generate_tts(voice_name, text, model_name="0.6B-Base (경량 클론)"):
         
         eng = get_engine()
         
-        # 모델 로드
-        if not eng.is_loaded:
-            yield None, f"⏳ 모델 로드 중... ({model_name})"
-            eng.load_model(model_name)
+        # 모델 로드 (모델 변경 시에도 재로드)
+        yield None, f"⏳ 모델 로드 중... ({model_name})"
+        eng.load_model(model_name)
         
         yield None, "🎤 음성 합성 중..."
         

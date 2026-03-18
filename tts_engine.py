@@ -25,22 +25,24 @@ torch.multinomial = _safe_multinomial
 
 
 def detect_device() -> str:
-    if torch.backends.mps.is_available():
-        return "mps"
+    """
+    [QA] MPS + float32는 0.6B에서도 OOM 발생 (exit 137).
+    MPS + float16은 생성 시 hang.
+    Mac에서는 CPU가 유일한 안정 옵션.
+    """
     if torch.cuda.is_available():
         return "cuda:0"
+    # MPS는 float16=hang, float32=OOM → CPU 사용
     return "cpu"
 
 
 def detect_dtype(device: str) -> torch.dtype:
     """
-    [QA] Mac MPS에서 bfloat16은 PyTorch 2.3+ 필요.
-    안전하게 float16 사용. CPU는 float32.
+    [QA] CUDA만 bfloat16. 그 외(MPS/CPU) float32.
+    MPS float16은 생성 시 hang/NaN 발생하므로 사용 불가.
     """
     if device == "cuda:0":
         return torch.bfloat16
-    if device == "mps":
-        return torch.float16
     return torch.float32
 
 
