@@ -1,0 +1,13 @@
+#!/opt/homebrew/bin/python3
+"""
+Qwen3-TTS CLI 실행 스크립트
+"""
+import sys
+from pathlib import Path
+
+# 프로젝트 경로 추가
+sys.path.insert(0, str(Path(__file__).parent))
+
+# cli.py 실행
+from cli import main
+main()

@@ -1,0 +1,8 @@
+#!/bin/bash
+# 웹 GUI 실행 스크립트
+export KMP_DUPLICATE_LIB_OK=TRUE
+cd "$(dirname "$0")"
+
+echo "🚀 Qwen3-TTS 웹 인터페이스 시작..."
+echo "📱 브라우저가 자동으로 열립니다: http://127.0.0.1:7860"
+/opt/homebrew/bin/python3 web.py

@@ -10,3 +10,5 @@ build/
 *.mp3
 *.m4a
 /tmp/
+gui.log
+.claude/
